@@ -20,6 +20,7 @@ STATE_FILE = "state.json"
 # ---------------- SETTINGS ----------------
 # Weekly "already pumped" filter
 W_LOOKBACK = 26        # weeks to look back
+W_FETCH = 70           # weekly candles to download (extra history for chart)
 W_PUMP_MIN = 80.0      # min % pump (low -> high) inside lookback
 W_KEEP_MIN = 0.50      # price must still hold >= 50% of that weekly move
 
@@ -101,6 +102,7 @@ def klines(sym, interval, n, secs):
 def weekly_pumped(df):
     if df is None or len(df) < 8:
         return None
+    wdf = df
     df = df.tail(W_LOOKBACK)
     lows = df["low"].values
     highs = df["high"].values
@@ -123,11 +125,17 @@ def weekly_pumped(df):
     keep = (close - best_low) / rng
     if keep < W_KEEP_MIN:
         return None
-    return {"w_pump": best, "w_low": best_low, "w_high": best_high, "w_keep": keep}
+    return {
+        "w_pump": best,
+        "w_low": best_low,
+        "w_high": best_high,
+        "w_keep": keep,
+        "w_df": wdf,
+    }
 
 
 def weekly_job(sym):
-    df = klines(sym, "Week1", W_LOOKBACK + 4, 7 * 86400)
+    df = klines(sym, "Week1", W_FETCH, 7 * 86400)
     r = weekly_pumped(df)
     return (sym, r) if r else None
 
@@ -224,9 +232,11 @@ def detect(df):
     }
 
 
-# ---------------- CHART ----------------
-def make_chart(sym, df, info):
-    d = df.tail(130).copy()
+# ---------------- CHARTS ----------------
+def make_chart(title, df, n_candles, levels, colors):
+    d = df.tail(n_candles).copy()
+    if len(d) < 5:
+        return None
     full = df["close"]
     e6 = full.ewm(span=6, adjust=False).mean().loc[d.index]
     e12 = full.ewm(span=12, adjust=False).mean().loc[d.index]
@@ -252,8 +262,6 @@ def make_chart(sym, df, info):
         mpf.make_addplot(e12, color="#ff9f1c", width=1.1),
         mpf.make_addplot(e20, color="#6c5ce7", width=1.3),
     ]
-    levels = [info["range_high"], info["range_low"], info["swing_high"], info["base_low"]]
-    colors = ["#2d98da", "#2d98da", "#8e44ad", "#8e44ad"]
     fig, axes = mpf.plot(
         d,
         type="candle",
@@ -261,7 +269,7 @@ def make_chart(sym, df, info):
         addplot=ap,
         hlines=dict(hlines=levels, colors=colors, linestyle="--", linewidths=0.8),
         figsize=(9, 6.2),
-        title=f"{sym}  4H  CONSOLIDATION",
+        title=title,
         returnfig=True,
         volume=False,
         warn_too_much_data=1000,
@@ -284,19 +292,57 @@ def make_chart(sym, df, info):
     return buf.getvalue()
 
 
+def chart_4h(sym, df, info):
+    levels = [info["range_high"], info["range_low"], info["swing_high"], info["base_low"]]
+    colors = ["#2d98da", "#2d98da", "#8e44ad", "#8e44ad"]
+    return make_chart(f"{sym}  4H  CONSOLIDATION", df, 130, levels, colors)
+
+
+def chart_weekly(sym, wdf, info):
+    levels = [info["w_high"], info["w_low"]]
+    colors = ["#8e44ad", "#8e44ad"]
+    return make_chart(f"{sym}  1W", wdf, 60, levels, colors)
+
+
 # ---------------- TELEGRAM ----------------
-def tg_photo(img, caption):
+def tg_photo(img, caption=None):
     if not TG_TOKEN or not TG_CHAT:
         print("Telegram secrets missing")
         return False
+    data = {"chat_id": TG_CHAT}
+    if caption:
+        data["caption"] = caption
+        data["parse_mode"] = "HTML"
     r = requests.post(
         f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
-        data={"chat_id": TG_CHAT, "caption": caption, "parse_mode": "HTML"},
+        data=data,
         files={"photo": ("chart.png", img, "image/png")},
         timeout=60,
     )
     if r.status_code != 200:
         print("Telegram error:", r.text[:200])
+    return r.status_code == 200
+
+
+def tg_album(img1, img2, caption):
+    if not TG_TOKEN or not TG_CHAT:
+        print("Telegram secrets missing")
+        return False
+    media = [
+        {"type": "photo", "media": "attach://p1", "caption": caption, "parse_mode": "HTML"},
+        {"type": "photo", "media": "attach://p2"},
+    ]
+    r = requests.post(
+        f"https://api.telegram.org/bot{TG_TOKEN}/sendMediaGroup",
+        data={"chat_id": TG_CHAT, "media": json.dumps(media)},
+        files={
+            "p1": ("4h.png", img1, "image/png"),
+            "p2": ("1w.png", img2, "image/png"),
+        },
+        timeout=90,
+    )
+    if r.status_code != 200:
+        print("Telegram album error:", r.text[:200])
     return r.status_code == 200
 
 
@@ -308,6 +354,32 @@ def tg_text(text):
         data={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"},
         timeout=30,
     )
+
+
+def send_alert(sym, df, info, caption):
+    img4 = None
+    imgw = None
+    try:
+        img4 = chart_4h(sym, df, info)
+    except Exception as e:
+        print("4h chart error", sym, e)
+    try:
+        imgw = chart_weekly(sym, info["w_df"], info)
+    except Exception as e:
+        print("weekly chart error", sym, e)
+
+    if img4 and imgw:
+        if tg_album(img4, imgw, caption):
+            return True
+        ok = tg_photo(img4, caption)
+        tg_photo(imgw)
+        return ok
+    if img4:
+        return tg_photo(img4, caption)
+    if imgw:
+        return tg_photo(imgw, caption)
+    tg_text(caption)
+    return True
 
 
 def fmt(x):
@@ -402,13 +474,7 @@ def main():
             f"Candles since top: {info['after']} | EMA spread {info['spread']:.1f}%\n"
             f"https://www.mexc.com/futures/{sym}"
         )
-        try:
-            img = make_chart(sym, df, info)
-            ok = tg_photo(img, cap)
-        except Exception as e:
-            print("chart error", sym, e)
-            tg_text(cap)
-            ok = True
+        ok = send_alert(sym, df, info, cap)
         if ok:
             state[key] = time.time()
             sent += 1
