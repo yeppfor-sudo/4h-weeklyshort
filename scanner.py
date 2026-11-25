@@ -1,396 +1,333 @@
-import os
-import io
-import json
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+# ============================================================
+# MEXC PERPETUAL 4H SCANNER -> TELEGRAM (GitHub Actions)
+# Pattern: Downtrend -> Low -> Volume-spike bounce above EMA20
+#          -> Pullback into compressed EMA 6/12/20 cluster
+# Crypto pairs only | alert once per 24h per pair
+# Charts: 4H + 1D + 7D (MEXC light theme)
+# ============================================================
+import os, io, re, json, time, math, warnings
+import requests
 import numpy as np
 import pandas as pd
-import requests
 import matplotlib
-
 matplotlib.use("Agg")
-import mplfinance as mpf  # noqa: E402
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from concurrent.futures import ThreadPoolExecutor, as_completed
+warnings.filterwarnings("ignore")
 
-BASE = "https://contract.mexc.com"
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
-STATE_FILE = "state.json"
+# ===================== SETTINGS =====================
+def envf(name, default):
+    return type(default)(os.getenv(name, default))
 
-# ---------------- SETTINGS ----------------
-# Weekly "already pumped" filter
-W_LOOKBACK = 26        # weeks to look back
-W_FETCH = 70           # weekly candles to download (extra history for chart)
-W_PUMP_MIN = 80.0      # min % pump (low -> high) inside lookback
-W_KEEP_MIN = 0.50      # price must still hold >= 50% of that weekly move
+USE_CLOSED_ONLY     = os.getenv("USE_CLOSED_ONLY", "true").lower() == "true"
+WORKERS             = 8
+MAX_ALERTS_PER_RUN  = envf("MAX_ALERTS_PER_RUN", 15)
+COOLDOWN_HOURS      = envf("COOLDOWN_HOURS", 24)
+EXTRA_EXCLUDE       = {x.strip().upper() for x in os.getenv("EXTRA_EXCLUDE", "").split(",") if x.strip()}
 
-# 4h pattern
-H4_CANDLES = 300
-IMPULSE_LOOKBACK = 120   # candles to search for the pump top (20 days)
-BASE_WINDOW = 60         # candles before the top used to find base low
-IMPULSE_MIN = 40.0       # min % pump base low -> top
-MIN_BARS_AFTER = 6       # min candles since the top
-MAX_BARS_AFTER = 70      # max candles since the top
-MAX_RETRACE = 0.50       # max pullback as fraction of the impulse
-RANGE_BARS = 12          # tight range window
-RANGE_MAX_PCT = 25.0     # max % width of that range
-EMA_SPREAD_MAX = 6.0     # max % spread between EMA 6/12/20
-NEAR_EMA20_MAX = 8.0     # price must be within this % above EMA20
-HOLD_MIN_CLOSES = 8      # of last 12 closes, at least this many above EMA20
+# --- Pattern rules ---
+DROP_LOOKBACK       = 120
+MIN_DROP_PCT        = 30.0
+MIN_BARS_SINCE_LOW  = 4
+MAX_BARS_SINCE_LOW  = 45
+MIN_BOUNCE_PCT      = 15.0
+MIN_BARS_SINCE_PEAK = 2
+MAX_BARS_SINCE_PEAK = 30
+MIN_VOL_SPIKE       = 3.0
+MIN_RETRACE         = 0.30
+MAX_RETRACE         = 0.95
+MAX_DIST_EMA20_PCT  = 3.5
+MAX_EMA_SPREAD_PCT  = 4.0
+REQUIRE_BREAK_EMA20 = True
 
-COOLDOWN_H = 48          # do not repeat the same pair within this many hours
-WORKERS = 6
-MAX_ALERTS = 15
-# ------------------------------------------
+PLOT_CANDLES        = 100
+STATE_FILE          = "sent_alerts.json"
 
-S = requests.Session()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# timeframe label -> (MEXC interval, seconds per candle, candles to fetch, x-label format)
+TF = {
+    "4H": ("Hour4", 4 * 3600,   300, "%m-%d %H:%M"),
+    "1D": ("Day1",  86400,      200, "%y-%m-%d"),
+    "7D": ("Week1", 7 * 86400,  120, "%y-%m-%d"),
+}
 
-def get(url, params=None, tries=4):
-    for i in range(tries):
-        try:
-            r = S.get(url, params=params, timeout=20)
-            if r.status_code == 429:
-                time.sleep(1.5 * (i + 1))
-                continue
-            r.raise_for_status()
-            time.sleep(0.05)
-            return r.json()
-        except Exception:
-            time.sleep(0.8 * (i + 1))
-    return None
+# ===================== CRYPTO-ONLY FILTER =====================
+NON_CRYPTO_BASES = {
+    # metals / energy / commodities
+    "XAU", "XAG", "GOLD", "SILVER", "OIL", "USOIL", "UKOIL", "BRENT", "WTI",
+    "NATGAS", "COPPER", "PLATINUM", "PALLADIUM",
+    # forex / indices
+    "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD", "SPX", "SPX500", "NAS100",
+    "NDX", "US30", "DJI", "DXY", "SP500", "NASDAQ",
+    # US stocks / ETFs
+    "AAPL", "TSLA", "NVDA", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NFLX",
+    "AMD", "INTC", "MSTR", "HOOD", "PLTR", "BABA", "UBER", "DIS", "NKE",
+    "PYPL", "SHOP", "ORCL", "CRM", "ADBE", "QCOM", "AVGO", "TSM", "SPY", "QQQ",
+    "IWM", "ARKK", "CRCL", "SNOW", "BA", "JPM", "V", "MA", "WMT", "KO", "PEP",
+}
+NON_CRYPTO_KW = ["stock", "forex", "commodit", "metal", "equit", "etf", "tradfi"]
 
-
-def get_symbols():
-    j = get(BASE + "/api/v1/contract/detail")
-    out = []
-    for c in (j or {}).get("data", []) or []:
-        if c.get("quoteCoin") == "USDT" and c.get("state") == 0 and not c.get("isHidden"):
-            out.append(c["symbol"])
-    return sorted(out)
-
-
-def klines(sym, interval, n, secs):
-    end = int(time.time())
-    start = end - n * secs
-    j = get(
-        f"{BASE}/api/v1/contract/kline/{sym}",
-        {"interval": interval, "start": start, "end": end},
-    )
-    d = (j or {}).get("data")
-    if not d or not d.get("time"):
-        return None
-    try:
-        df = pd.DataFrame(
-            {
-                "time": d["time"],
-                "open": d["open"],
-                "high": d["high"],
-                "low": d["low"],
-                "close": d["close"],
-                "vol": d["vol"],
-            }
-        ).astype(float)
-    except Exception:
-        return None
-    df["dt"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    df = df.set_index("dt").sort_index()
-    return df
-
-
-# ---------------- WEEKLY FILTER ----------------
-def weekly_pumped(df):
-    if df is None or len(df) < 8:
-        return None
-    wdf = df
-    df = df.tail(W_LOOKBACK)
-    lows = df["low"].values
-    highs = df["high"].values
-    min_low = np.inf
-    best = 0.0
-    best_low = best_high = None
-    for i in range(len(df)):
-        if lows[i] > 0:
-            min_low = min(min_low, lows[i])
-        if np.isfinite(min_low) and min_low > 0:
-            g = (highs[i] / min_low - 1) * 100
-            if g > best:
-                best, best_low, best_high = g, min_low, highs[i]
-    if best < W_PUMP_MIN or best_low is None:
-        return None
-    close = df["close"].values[-1]
-    rng = best_high - best_low
-    if rng <= 0:
-        return None
-    keep = (close - best_low) / rng
-    if keep < W_KEEP_MIN:
-        return None
-    return {
-        "w_pump": best,
-        "w_low": best_low,
-        "w_high": best_high,
-        "w_keep": keep,
-        "w_df": wdf,
-    }
-
-
-def weekly_job(sym):
-    df = klines(sym, "Week1", W_FETCH, 7 * 86400)
-    r = weekly_pumped(df)
-    return (sym, r) if r else None
-
-
-# ---------------- 4H PATTERN (CONSOLIDATION ONLY) ----------------
-def detect(df):
-    c = df.copy()
-    now = pd.Timestamp.now(tz="UTC")
-    if c.index[-1] + pd.Timedelta(hours=4) > now:
-        c = c.iloc[:-1]  # drop the forming candle
-    if len(c) < 130:
-        return None
-    for n in (6, 12, 20):
-        c[f"e{n}"] = c["close"].ewm(span=n, adjust=False).mean()
-
-    w = c.tail(IMPULSE_LOOKBACK)
-    H = w["high"].values
-    L = w["low"].values
-    C = w["close"].values
-    E6 = w["e6"].values
-    E12 = w["e12"].values
-    E20 = w["e20"].values
-
-    # --- impulse top (search all candles before the last one)
-    pre_H = H[:-1]
-    hi_i = int(pre_H.argmax())
-    after = len(pre_H) - 1 - hi_i
-    if after < MIN_BARS_AFTER or after > MAX_BARS_AFTER or hi_i < 20:
-        return None
-
-    lo_start = max(0, hi_i - BASE_WINDOW)
-    base_low = float(L[lo_start : hi_i + 1].min())
-    swing_high = float(pre_H[hi_i])
-    if base_low <= 0 or swing_high <= base_low:
-        return None
-    impulse = (swing_high / base_low - 1) * 100
-    if impulse < IMPULSE_MIN:
-        return None
-
-    # --- shallow pullback after the top
-    seg_low = float(L[hi_i + 1 : -1].min())
-    retrace = (swing_high - seg_low) / (swing_high - base_low)
-    if retrace > MAX_RETRACE:
-        return None
-
-    # --- tight range (levels from candles BEFORE the last one)
-    rh_prev = float(H[-RANGE_BARS - 1 : -1].max())
-    rl_prev = float(L[-RANGE_BARS - 1 : -1].min())
-    range_pct = (rh_prev / rl_prev - 1) * 100
-    if range_pct > RANGE_MAX_PCT:
-        return None
-
-    e6, e12, e20 = E6[-1], E12[-1], E20[-1]
-    last_c = C[-1]
-
-    # --- EMAs compressed, bullish, rising
-    spread = (max(e6, e12, e20) - min(e6, e12, e20)) / last_c * 100
-    if spread > EMA_SPREAD_MAX:
-        return None
-    if e12 < e20 * 0.995:
-        return None
-    if E20[-1] <= E20[-20]:
-        return None
-
-    # --- NO breakout: close must not be above the range high
-    if last_c > rh_prev:
-        return None
-    # --- NO breakdown: close must hold EMA20 and the range low
-    if last_c < e20 or last_c < rl_prev:
-        return None
-
-    # --- price hugging the EMAs
-    near = (last_c / e20 - 1) * 100
-    if near > NEAR_EMA20_MAX:
-        return None
-    held = int((C[-RANGE_BARS:] >= E20[-RANGE_BARS:] * 0.995).sum())
-    if held < HOLD_MIN_CLOSES:
-        return None
-
-    return {
-        "sig": "CONSOLIDATION",
-        "candle_time": c.index[-1],
-        "price": float(last_c),
-        "base_low": base_low,
-        "swing_high": swing_high,
-        "range_high": rh_prev,
-        "range_low": rl_prev,
-        "impulse": impulse,
-        "retrace": retrace * 100,
-        "range_pct": range_pct,
-        "spread": spread,
-        "after": after,
-        "near": near,
-    }
-
-
-# ---------------- CHARTS ----------------
-def make_chart(title, df, n_candles, levels, colors):
-    d = df.tail(n_candles).copy()
-    if len(d) < 5:
-        return None
-    full = df["close"]
-    e6 = full.ewm(span=6, adjust=False).mean().loc[d.index]
-    e12 = full.ewm(span=12, adjust=False).mean().loc[d.index]
-    e20 = full.ewm(span=20, adjust=False).mean().loc[d.index]
-    d = d.rename(
-        columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "vol": "Volume"}
-    )
-    d.index = d.index.tz_convert(None)
-    e6.index = e12.index = e20.index = d.index
-
-    mc = mpf.make_marketcolors(
-        up="#1fa971", down="#ef4e5c", edge="inherit", wick="inherit", volume="inherit"
-    )
-    style = mpf.make_mpf_style(
-        marketcolors=mc,
-        facecolor="white",
-        figcolor="white",
-        gridcolor="#eeeeee",
-        gridstyle="-",
-    )
-    ap = [
-        mpf.make_addplot(e6, color="#e056c8", width=1.1),
-        mpf.make_addplot(e12, color="#ff9f1c", width=1.1),
-        mpf.make_addplot(e20, color="#6c5ce7", width=1.3),
-    ]
-    fig, axes = mpf.plot(
-        d,
-        type="candle",
-        style=style,
-        addplot=ap,
-        hlines=dict(hlines=levels, colors=colors, linestyle="--", linewidths=0.8),
-        figsize=(9, 6.2),
-        title=title,
-        returnfig=True,
-        volume=False,
-        warn_too_much_data=1000,
-    )
-    fig.text(
-        0.5,
-        0.5,
-        "RANJHA",
-        fontsize=70,
-        color="gray",
-        alpha=0.10,
-        ha="center",
-        va="center",
-        rotation=25,
-        weight="bold",
-    )
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def chart_4h(sym, df, info):
-    levels = [info["range_high"], info["range_low"], info["swing_high"], info["base_low"]]
-    colors = ["#2d98da", "#2d98da", "#8e44ad", "#8e44ad"]
-    return make_chart(f"{sym}  4H  CONSOLIDATION", df, 130, levels, colors)
-
-
-def chart_weekly(sym, wdf, info):
-    levels = [info["w_high"], info["w_low"]]
-    colors = ["#8e44ad", "#8e44ad"]
-    return make_chart(f"{sym}  1W", wdf, 60, levels, colors)
-
-
-# ---------------- TELEGRAM ----------------
-def tg_photo(img, caption=None):
-    if not TG_TOKEN or not TG_CHAT:
-        print("Telegram secrets missing")
+def is_crypto(d):
+    base = str(d.get("baseCoin", "")).upper()
+    if base in NON_CRYPTO_BASES or base in EXTRA_EXCLUDE:
         return False
-    data = {"chat_id": TG_CHAT}
-    if caption:
-        data["caption"] = caption
-        data["parse_mode"] = "HTML"
-    r = requests.post(
-        f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
-        data=data,
-        files={"photo": ("chart.png", img, "image/png")},
-        timeout=60,
-    )
-    if r.status_code != 200:
-        print("Telegram error:", r.text[:200])
-    return r.status_code == 200
-
-
-def tg_album(img1, img2, caption):
-    if not TG_TOKEN or not TG_CHAT:
-        print("Telegram secrets missing")
+    if re.search(r"(STOCK|ETF)$", base):
         return False
-    media = [
-        {"type": "photo", "media": "attach://p1", "caption": caption, "parse_mode": "HTML"},
-        {"type": "photo", "media": "attach://p2"},
-    ]
-    r = requests.post(
-        f"https://api.telegram.org/bot{TG_TOKEN}/sendMediaGroup",
-        data={"chat_id": TG_CHAT, "media": json.dumps(media)},
-        files={
-            "p1": ("4h.png", img1, "image/png"),
-            "p2": ("1w.png", img2, "image/png"),
-        },
-        timeout=90,
-    )
-    if r.status_code != 200:
-        print("Telegram album error:", r.text[:200])
-    return r.status_code == 200
-
-
-def tg_text(text):
-    if not TG_TOKEN or not TG_CHAT:
-        return
-    requests.post(
-        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-        data={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"},
-        timeout=30,
-    )
-
-
-def send_alert(sym, df, info, caption):
-    img4 = None
-    imgw = None
-    try:
-        img4 = chart_4h(sym, df, info)
-    except Exception as e:
-        print("4h chart error", sym, e)
-    try:
-        imgw = chart_weekly(sym, info["w_df"], info)
-    except Exception as e:
-        print("weekly chart error", sym, e)
-
-    if img4 and imgw:
-        if tg_album(img4, imgw, caption):
-            return True
-        ok = tg_photo(img4, caption)
-        tg_photo(imgw)
-        return ok
-    if img4:
-        return tg_photo(img4, caption)
-    if imgw:
-        return tg_photo(imgw, caption)
-    tg_text(caption)
+    plates = " ".join(str(x) for x in (d.get("conceptPlate") or [])).lower()
+    if any(k in plates for k in NON_CRYPTO_KW):
+        return False
     return True
 
+# ===================== MEXC API =====================
+BASE = "https://contract.mexc.com/api/v1/contract"
+HDR = {"User-Agent": "Mozilla/5.0"}
 
-def fmt(x):
-    if x >= 100:
-        return f"{x:.2f}"
-    if x >= 1:
-        return f"{x:.4f}"
-    return f"{x:.6f}"
+def get_json(url, params=None, tries=4):
+    for t in range(tries):
+        try:
+            r = requests.get(url, params=params, headers=HDR, timeout=15)
+            if r.status_code == 429:
+                time.sleep(1.5 * (t + 1)); continue
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            time.sleep(0.6 * (t + 1))
+    return None
 
+def get_symbols():
+    j = get_json(f"{BASE}/detail")
+    out, excluded = [], []
+    if j and j.get("data"):
+        for d in j["data"]:
+            if d.get("quoteCoin") != "USDT" or d.get("state", 0) != 0:
+                continue
+            (out if is_crypto(d) else excluded).append(d["symbol"])
+    print(f"Crypto pairs: {len(out)} | excluded non-crypto: {len(excluded)}")
+    if excluded:
+        print("Excluded:", ", ".join(sorted(excluded)))
+    return sorted(set(out))
 
-# ---------------- STATE ----------------
+def get_klines(symbol, tf):
+    interval, secs, n, _ = TF[tf]
+    end = int(time.time())
+    j = get_json(f"{BASE}/kline/{symbol}",
+                 {"interval": interval, "start": end - n * secs, "end": end})
+    if not j or not j.get("data") or not j["data"].get("time"):
+        return None
+    d = j["data"]
+    df = pd.DataFrame({
+        "time": pd.to_datetime(d["time"], unit="s"),
+        "open": d["open"], "high": d["high"], "low": d["low"],
+        "close": d["close"], "vol": d["vol"],
+    }).astype({"open": float, "high": float, "low": float,
+               "close": float, "vol": float})
+    df = df.reset_index(drop=True)
+    df["e6"]  = df.close.ewm(span=6,  adjust=False).mean()
+    df["e12"] = df.close.ewm(span=12, adjust=False).mean()
+    df["e20"] = df.close.ewm(span=20, adjust=False).mean()
+    return df
+
+# ===================== PATTERN DETECTION =====================
+def detect(df):
+    n = len(df)
+    if n < 80:
+        return None
+    h, l, c, v = df.high.values, df.low.values, df.close.values, df.vol.values
+    e6, e12, e20 = df.e6.values, df.e12.values, df.e20.values
+
+    w0 = max(0, n - 1 - MAX_BARS_SINCE_LOW)
+    i_low = w0 + int(np.argmin(l[w0:]))
+    since_low = n - 1 - i_low
+    if since_low < MIN_BARS_SINCE_LOW or since_low > MAX_BARS_SINCE_LOW:
+        return None
+
+    p0 = max(0, i_low - DROP_LOOKBACK)
+    if i_low - p0 < 20:
+        return None
+    i_high = p0 + int(np.argmax(h[p0:i_low + 1]))
+    if i_low - i_high < 10:
+        return None
+    drop = (h[i_high] - l[i_low]) / h[i_high] * 100
+    if drop < MIN_DROP_PCT:
+        return None
+    if not (e6[i_low] < e12[i_low] < e20[i_low]):
+        return None
+
+    i_peak = i_low + int(np.argmax(h[i_low:]))
+    if i_peak <= i_low:
+        return None
+    bounce = (h[i_peak] / l[i_low] - 1) * 100
+    since_peak = n - 1 - i_peak
+    if bounce < MIN_BOUNCE_PCT:
+        return None
+    if since_peak < MIN_BARS_SINCE_PEAK or since_peak > MAX_BARS_SINCE_PEAK:
+        return None
+    if REQUIRE_BREAK_EMA20 and h[i_peak] <= e20[i_peak]:
+        return None
+
+    b0 = max(0, i_low - 30)
+    base = v[b0:i_low].mean() if i_low > b0 else 0
+    if base <= 0:
+        return None
+    spike = v[i_low:min(n, i_peak + 2)].max() / base
+    if spike < MIN_VOL_SPIKE:
+        return None
+
+    rng = h[i_peak] - l[i_low]
+    retrace = (h[i_peak] - c[-1]) / rng if rng > 0 else 0
+    if retrace < MIN_RETRACE or retrace > MAX_RETRACE:
+        return None
+
+    dist = abs(c[-1] - e20[-1]) / e20[-1] * 100
+    ema_vals = [e6[-1], e12[-1], e20[-1]]
+    spread = (max(ema_vals) - min(ema_vals)) / c[-1] * 100
+    if dist > MAX_DIST_EMA20_PCT or spread > MAX_EMA_SPREAD_PCT:
+        return None
+
+    score = (min(drop, 70) / 70 * 30 + min(bounce, 60) / 60 * 25 +
+             min(spike, 10) / 10 * 20 +
+             (1 - spread / MAX_EMA_SPREAD_PCT) * 15 +
+             (1 - dist / MAX_DIST_EMA20_PCT) * 10)
+    return dict(score=round(score, 1), price=float(c[-1]),
+                drop_pct=round(drop, 1), bounce_pct=round(bounce, 1),
+                vol_spike=round(spike, 1), retrace=round(retrace * 100, 1),
+                dist_ema20_pct=round(dist, 2), ema_spread_pct=round(spread, 2),
+                bars_since_low=since_low, bars_since_peak=since_peak,
+                i_low=i_low, i_peak=i_peak)
+
+# ===================== CHART (MEXC light theme) =====================
+UP, DOWN = "#2EBD85", "#F6465D"
+C6, C12, C20 = "#D98FD0", "#F5A142", "#7B61FF"
+VMA5, VMA10 = "#F7A8F0", "#6EC1FF"
+GRID, TXT = "#EEF0F3", "#8A9099"
+
+def fmt_p(p):
+    dec = max(2, 3 - int(math.floor(math.log10(abs(p) if p else 1))))
+    return f"{p:.{dec}f}"
+
+def make_chart(symbol, df, tf, info=None):
+    d = df.tail(PLOT_CANDLES).reset_index(drop=True)
+    off = len(df) - len(d)
+    x = np.arange(len(d))
+    fig = plt.figure(figsize=(7.2, 7.4), facecolor="white")
+    gs = fig.add_gridspec(2, 1, height_ratios=[4, 1], hspace=0.05)
+    ax = fig.add_subplot(gs[0]); axv = fig.add_subplot(gs[1], sharex=ax)
+    for a in (ax, axv):
+        a.set_facecolor("white"); a.grid(True, color=GRID, lw=0.8)
+        a.yaxis.tick_right()
+        for s in a.spines.values(): s.set_visible(False)
+        a.tick_params(colors=TXT, labelsize=9, length=0)
+
+    for i, r in d.iterrows():
+        col = UP if r.close >= r.open else DOWN
+        ax.vlines(i, r.low, r.high, color=col, lw=1)
+        ax.add_patch(Rectangle((i - 0.32, min(r.open, r.close)), 0.64,
+                               max(abs(r.close - r.open), r.close * 1e-6),
+                               color=col, lw=0))
+    ax.plot(x, d.e6, color=C6, lw=1.3)
+    ax.plot(x, d.e12, color=C12, lw=1.3)
+    ax.plot(x, d.e20, color=C20, lw=1.5)
+
+    ih, il = int(d.high.values.argmax()), int(d.low.values.argmin())
+    ax.annotate(fmt_p(d.high[ih]), (ih, d.high[ih]), xytext=(ih + 4, d.high[ih]),
+                fontsize=9, color="#222",
+                arrowprops=dict(arrowstyle="-", color="#222", lw=0.8))
+    ax.annotate(fmt_p(d.low[il]), (il, d.low[il]), xytext=(max(il - 14, 0), d.low[il]),
+                fontsize=9, color="#222",
+                arrowprops=dict(arrowstyle="-", color="#222", lw=0.8))
+
+    last = d.close.iloc[-1]
+    ax.axhline(last, color=UP, ls="--", lw=0.9)
+    ax.text(1.005, last, fmt_p(last), transform=ax.get_yaxis_transform(),
+            fontsize=9, color=UP, va="center", ha="left",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=UP))
+
+    ax.text(0.01, 1.05, f"{symbol}  {tf}  (UTC)", transform=ax.transAxes,
+            fontsize=11, weight="bold", color="#222")
+    ax.text(0.01, 1.01, f"EMA6:{fmt_p(d.e6.iloc[-1])}", transform=ax.transAxes, fontsize=9, color=C6)
+    ax.text(0.30, 1.01, f"EMA12:{fmt_p(d.e12.iloc[-1])}", transform=ax.transAxes, fontsize=9, color=C12)
+    ax.text(0.60, 1.01, f"EMA20:{fmt_p(d.e20.iloc[-1])}", transform=ax.transAxes, fontsize=9, color=C20)
+
+    if info and tf == "4H":
+        for key, mk in (("i_low", "^"), ("i_peak", "v")):
+            k = info[key] - off
+            if 0 <= k < len(d):
+                y = d.low[k] if key == "i_low" else d.high[k]
+                ax.plot(k, y, marker=mk, color="#444", ms=5)
+
+    vc = [UP if o <= c_ else DOWN for o, c_ in zip(d.open, d.close)]
+    axv.bar(x, d.vol, color=vc, width=0.7)
+    axv.plot(x, d.vol.rolling(5).mean(), color=VMA5, lw=1)
+    axv.plot(x, d.vol.rolling(10).mean(), color=VMA10, lw=1)
+    axv.set_ylim(0, d.vol.max() * 1.15 if d.vol.max() > 0 else 1)
+
+    step = max(1, len(d) // 7)
+    ticks = list(range(0, len(d), step))
+    axv.set_xticks(ticks)
+    axv.set_xticklabels([d.time[i].strftime(TF[tf][3]) for i in ticks])
+    plt.setp(ax.get_xticklabels(), visible=False)
+    ax.set_xlim(-1, len(d) + 2)
+    ax.margins(y=0.08)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+# ===================== TELEGRAM =====================
+def tg_post(method, data, files=None, tries=3):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    for t in range(tries):
+        try:
+            r = requests.post(url, data=data, files=files, timeout=60)
+            if r.status_code == 429:
+                wait = r.json().get("parameters", {}).get("retry_after", 5)
+                time.sleep(wait + 1); 
+                if files:
+                    for f in files.values(): f[1].seek(0)
+                continue
+            if r.ok:
+                return True
+            print("Telegram error:", r.status_code, r.text[:200])
+            return False
+        except Exception as e:
+            print("Telegram exception:", e)
+            time.sleep(2)
+    return False
+
+def send_alert(symbol, info, images):
+    coin = symbol.replace("_USDT", "")
+    caption = (
+        f"🚨 <b>{symbol}</b> | 4H Reversal Retest\n"
+        f"Price: <code>{fmt_p(info['price'])}</code>  |  Score: {info['score']}\n"
+        f"📉 Drop: {info['drop_pct']}%   📈 Bounce: {info['bounce_pct']}%\n"
+        f"🔊 Volume spike: x{info['vol_spike']}   ↩️ Retrace: {info['retrace']}%\n"
+        f"📏 Dist to EMA20: {info['dist_ema20_pct']}%   🔗 EMA spread: {info['ema_spread_pct']}%\n"
+        f"Charts: {' / '.join(k for k, _ in images)}\n"
+        f"https://futures.mexc.com/exchange/{coin}_USDT"
+    )
+    if len(images) == 1:
+        name, buf = images[0]
+        return tg_post("sendPhoto", {"chat_id": CHAT_ID, "caption": caption,
+                                     "parse_mode": "HTML"},
+                       {"photo": (f"{symbol}_{name}.png", buf, "image/png")})
+    media, files = [], {}
+    for i, (name, buf) in enumerate(images):
+        key = f"p{i}"
+        item = {"type": "photo", "media": f"attach://{key}"}
+        if i == 0:
+            item["caption"] = caption
+            item["parse_mode"] = "HTML"
+        media.append(item)
+        files[key] = (f"{symbol}_{name}.png", buf, "image/png")
+    return tg_post("sendMediaGroup",
+                   {"chat_id": CHAT_ID, "media": json.dumps(media)}, files)
+
+# ===================== STATE (24h dedupe) =====================
 def load_state():
     try:
         with open(STATE_FILE) as f:
@@ -398,91 +335,66 @@ def load_state():
     except Exception:
         return {}
 
-
 def save_state(state):
-    cutoff = time.time() - 7 * 86400
-    state = {k: v for k, v in state.items() if v > cutoff}
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+        json.dump(state, f, indent=1, sort_keys=True)
 
-
-def cooldown_ok(state, key, hours):
-    return (time.time() - state.get(key, 0)) > hours * 3600
-
-
-# ---------------- MAIN ----------------
-def h4_job(item):
-    sym, wk = item
-    df = klines(sym, "Hour4", H4_CANDLES, 4 * 3600)
+# ===================== MAIN =====================
+def scan_one(sym):
+    df = get_klines(sym, "4H")
     if df is None:
-        return None
-    info = detect(df)
-    if not info:
-        return None
-    info.update(wk)
-    return sym, df, info
-
+        return sym, None, None
+    det_df = df.iloc[:-1] if (USE_CLOSED_ONLY and len(df) > 1) else df
+    return sym, df, detect(det_df)
 
 def main():
-    syms = get_symbols()
-    print(f"Pairs: {len(syms)}")
-    if not syms:
+    now = time.time()
+    state = {k: v for k, v in load_state().items() if now - v < 48 * 3600}
+    save_state(state)
+
+    symbols = get_symbols()
+    print(f"Scanning {len(symbols)} pairs on 4H...")
+    results, cache = [], {}
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        for f in as_completed([ex.submit(scan_one, s) for s in symbols]):
+            sym, df, info = f.result()
+            if info:
+                cache[sym] = df
+                results.append({"symbol": sym, **info})
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+    print(f"Matches: {len(results)}")
+    for r in results:
+        print(f"  {r['symbol']}  score={r['score']}  drop={r['drop_pct']}%  "
+              f"bounce={r['bounce_pct']}%  vol x{r['vol_spike']}")
+
+    if not results:
         return
-    state = load_state()
-
-    pumped = []
-    with ThreadPoolExecutor(WORKERS) as ex:
-        futs = [ex.submit(weekly_job, s) for s in syms]
-        for f in as_completed(futs):
-            try:
-                r = f.result()
-            except Exception:
-                r = None
-            if r:
-                pumped.append(r)
-    pumped.sort(key=lambda x: -x[1]["w_pump"])
-    print(f"Weekly pumped: {len(pumped)}")
-
-    hits = []
-    with ThreadPoolExecutor(WORKERS) as ex:
-        futs = [ex.submit(h4_job, it) for it in pumped]
-        for f in as_completed(futs):
-            try:
-                r = f.result()
-            except Exception:
-                r = None
-            if r:
-                hits.append(r)
-    print(f"4H consolidation hits: {len(hits)}")
-
-    hits.sort(key=lambda x: -x[2]["impulse"])
+    if not BOT_TOKEN or not CHAT_ID:
+        print("ERROR: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secrets are missing.")
+        raise SystemExit(1)
 
     sent = 0
-    for sym, df, info in hits:
-        if sent >= MAX_ALERTS:
-            break
-        key = f"{sym}|CONSOLIDATION"
-        if not cooldown_ok(state, key, COOLDOWN_H):
+    for r in results:
+        sym = r["symbol"]
+        if now - state.get(sym, 0) < COOLDOWN_HOURS * 3600:
+            print(f"  skip {sym} (alerted within {COOLDOWN_HOURS}h)")
             continue
-        name = sym.replace("_", "")
-        cap = (
-            f"⏳ <b>{name}</b> | 4H CONSOLIDATION\n"
-            f"Price: {fmt(info['price'])}\n"
-            f"Weekly pump: +{info['w_pump']:.0f}% (holding {info['w_keep']*100:.0f}%)\n"
-            f"4H impulse: +{info['impulse']:.0f}% | pullback {info['retrace']:.0f}%\n"
-            f"Range: {fmt(info['range_low'])} - {fmt(info['range_high'])} ({info['range_pct']:.1f}%)\n"
-            f"Candles since top: {info['after']} | EMA spread {info['spread']:.1f}%\n"
-            f"https://www.mexc.com/futures/{sym}"
-        )
-        ok = send_alert(sym, df, info, cap)
-        if ok:
-            state[key] = time.time()
+        if sent >= MAX_ALERTS_PER_RUN:
+            print("Max alerts per run reached.")
+            break
+        images = [("4H", make_chart(sym, cache[sym], "4H", r))]
+        for tf in ("1D", "7D"):
+            dft = get_klines(sym, tf)
+            if dft is not None and len(dft) >= 10:
+                images.append((tf, make_chart(sym, dft, tf)))
+        if send_alert(sym, r, images):
+            state[sym] = time.time()
+            save_state(state)
             sent += 1
-            time.sleep(1)
-
-    save_state(state)
+            print(f"  sent {sym}")
+        time.sleep(1.5)
     print(f"Alerts sent: {sent}")
-
 
 if __name__ == "__main__":
     main()
