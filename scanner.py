@@ -4,12 +4,13 @@
 #   1) Downtrend  -> 2) Base at low -> 3) Volume-spike PUMP above EMA20
 #   -> 4) RETEST of EMA 6/12/20 cluster -> 5) HOLD (higher low, no
 #   close below EMA20) and MOVE UPSIDE
-# Crypto pairs only | alert once per 24h per pair
+# Crypto pairs only | alert once per 24h per pair | ALERT ONLY IF SCORE >= 62
 # Charts: 4H + 1D + 7D (MEXC light theme)
-# DEBUG: prints reject reasons + near misses. TEST_SYMBOL=CFG_USDT
-#        runs one pair, prints all metrics, sends nothing.
+# Rate-limit safe: global throttle + retry passes for failed fetches
+# DEBUG: reject reasons + near misses + API error counts.
+#        TEST_SYMBOL=CFG_USDT runs one pair, sends nothing.
 # ============================================================
-import os, io, re, json, time, math, warnings
+import os, io, re, json, time, math, threading, warnings
 from collections import Counter
 import requests
 import numpy as np
@@ -25,8 +26,11 @@ warnings.filterwarnings("ignore")
 def envf(name, default):
     return type(default)(os.getenv(name, default))
 
+MIN_SCORE           = envf("MIN_SCORE", 62.0)      # alert only if score >= this
 USE_CLOSED_ONLY     = os.getenv("USE_CLOSED_ONLY", "true").lower() == "true"
-WORKERS             = 6
+WORKERS             = envf("WORKERS", 4)
+REQ_INTERVAL        = envf("REQ_INTERVAL", 0.12)   # seconds between requests (global)
+RETRY_PASSES        = envf("RETRY_PASSES", 2)      # extra passes for pairs with no data
 MAX_ALERTS_PER_RUN  = envf("MAX_ALERTS_PER_RUN", 15)
 COOLDOWN_HOURS      = envf("COOLDOWN_HOURS", 24)
 EXTRA_EXCLUDE       = {x.strip().upper() for x in os.getenv("EXTRA_EXCLUDE", "").split(",") if x.strip()}
@@ -80,7 +84,6 @@ TF = {
     "7D": ("Week1", 7 * 86400,  120, "%y-%m-%d"),
 }
 
-# order of checks (used to detect "near misses")
 REASON_ORDER = ["no_data", "too_short", "low_window", "drop_small", "ema_stack_low",
                 "bounce_small", "peak_age", "vol_base", "vol_spike", "spike_not_green",
                 "spike_below_ema20", "base_range", "retrace", "retest_touch",
@@ -112,20 +115,36 @@ def is_crypto(d):
         return False
     return True
 
-# ===================== MEXC API =====================
+# ===================== MEXC API (rate-limit safe) =====================
 BASE = "https://contract.mexc.com/api/v1/contract"
 HDR = {"User-Agent": "Mozilla/5.0"}
+SESSION = requests.Session()
+SESSION.headers.update(HDR)
+ERRS = Counter()
+_rl_lock = threading.Lock()
+_last_req = [0.0]
 
-def get_json(url, params=None, tries=4):
+def throttle():
+    with _rl_lock:
+        wait = _last_req[0] + REQ_INTERVAL - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _last_req[0] = time.time()
+
+def get_json(url, params=None, tries=5):
     for t in range(tries):
+        throttle()
         try:
-            r = requests.get(url, params=params, headers=HDR, timeout=15)
-            if r.status_code == 429:
-                time.sleep(1.5 * (t + 1)); continue
+            r = SESSION.get(url, params=params, timeout=20)
+            if r.status_code == 429 or r.status_code >= 500:
+                ERRS[f"http_{r.status_code}"] += 1
+                time.sleep(2 * (t + 1))
+                continue
             r.raise_for_status()
             return r.json()
-        except Exception:
-            time.sleep(0.6 * (t + 1))
+        except Exception as e:
+            ERRS[type(e).__name__] += 1
+            time.sleep(1 + t)
     return None
 
 def get_symbols():
@@ -145,6 +164,8 @@ def get_klines(symbol, tf):
     j = get_json(f"{BASE}/kline/{symbol}",
                  {"interval": interval, "start": end - n * secs, "end": end})
     if not j or not j.get("data") or not j["data"].get("time"):
+        if j is not None:
+            ERRS["empty_kline"] += 1
         return None
     d = j["data"]
     df = pd.DataFrame({
@@ -185,7 +206,7 @@ def detect(df):
     if i_low - i_high < MIN_BARS_HIGH_TO_LOW:
         return None, "drop_small", m
     drop = (h[i_high] - l[i_low]) / h[i_high] * 100
-    m["drop%"] = round(drop, 1)
+    m["drop%"] = round(float(drop), 1)
     if drop < MIN_DROP_PCT:
         return None, "drop_small", m
     if not (e6[i_low] < e12[i_low] < e20[i_low]):
@@ -197,7 +218,7 @@ def detect(df):
         return None, "bounce_small", m
     bounce = (h[i_peak] / l[i_low] - 1) * 100
     since_peak = n - 1 - i_peak
-    m["bounce%"] = round(bounce, 1); m["bars_since_peak"] = since_peak
+    m["bounce%"] = round(float(bounce), 1); m["bars_since_peak"] = since_peak
     if bounce < MIN_BOUNCE_PCT:
         return None, "bounce_small", m
     if since_peak < MIN_BARS_SINCE_PEAK or since_peak > MAX_BARS_SINCE_PEAK:
@@ -210,7 +231,7 @@ def detect(df):
     s_end = min(n, i_peak + 2)
     i_spike = i_low + int(np.argmax(v[i_low:s_end]))
     spike = v[i_spike] / base_vol
-    m["vol_spike_x"] = round(spike, 1)
+    m["vol_spike_x"] = round(float(spike), 1)
     if spike < MIN_VOL_SPIKE:
         return None, "vol_spike", m
     if REQUIRE_GREEN_SPIKE and c[i_spike] <= o[i_spike]:
@@ -225,32 +246,32 @@ def detect(df):
     if be - bs >= 3:
         lo_b = l[bs:be].min()
         base_rng = (h[bs:be].max() - lo_b) / lo_b * 100
-    m["base_range%"] = round(base_rng, 1)
+    m["base_range%"] = round(float(base_rng), 1)
     if base_rng > MAX_BASE_RANGE_PCT:
         return None, "base_range", m
 
     # ---------- 4) RETEST ----------
     rng = h[i_peak] - l[i_low]
     retrace = (h[i_peak] - c[-1]) / rng if rng > 0 else 0
-    m["retrace%"] = round(retrace * 100, 1)
+    m["retrace%"] = round(float(retrace) * 100, 1)
     if retrace < MIN_RETRACE or retrace > MAX_RETRACE:
         return None, "retrace", m
 
     k_rl = i_peak + int(np.argmin(l[i_peak:]))
     retest_low = l[k_rl]
     touch = (retest_low / e20[k_rl] - 1) * 100
-    m["retest_touch%"] = round(touch, 2)
+    m["retest_touch%"] = round(float(touch), 2)
     if touch > RETEST_TOUCH_PCT:
         return None, "retest_touch", m
 
     ema_vals = [e6[-1], e12[-1], e20[-1]]
     spread = (max(ema_vals) - min(ema_vals)) / c[-1] * 100
-    m["ema_spread%"] = round(spread, 2)
+    m["ema_spread%"] = round(float(spread), 2)
     if spread > MAX_EMA_SPREAD_PCT:
         return None, "ema_spread", m
 
     dist = (c[-1] - e20[-1]) / e20[-1] * 100
-    m["dist_ema20%"] = round(dist, 2)
+    m["dist_ema20%"] = round(float(dist), 2)
     if dist < MIN_DIST_EMA20_PCT or dist > MAX_DIST_EMA20_PCT:
         return None, "dist_ema20", m
 
@@ -259,12 +280,12 @@ def detect(df):
         if (c[i_spike + 1:] < e20[i_spike + 1:] * (1 - HOLD_TOL_PCT / 100)).any():
             return None, "hold_broke_ema20", m
     higher_low = (retest_low / l[i_low] - 1) * 100
-    m["higher_low%"] = round(higher_low, 1)
+    m["higher_low%"] = round(float(higher_low), 1)
     if higher_low < MIN_HIGHER_LOW_PCT:
         return None, "higher_low", m
 
     slope = (e20[-1] / e20[-7] - 1) * 100
-    m["ema20_slope%"] = round(slope, 2)
+    m["ema20_slope%"] = round(float(slope), 2)
     if slope < MIN_EMA20_SLOPE_PCT:
         return None, "ema20_slope", m
 
@@ -282,15 +303,15 @@ def detect(df):
              max(0, 1 - spread / MAX_EMA_SPREAD_PCT) * 20 +
              max(0, 1 - abs(dist) / MAX_DIST_EMA20_PCT) * 10 +
              min(higher_low, 15) / 15 * 15)
-    info = dict(score=round(score, 1), price=float(c[-1]),
-                drop_pct=round(drop, 1), bounce_pct=round(bounce, 1),
-                vol_spike=round(spike, 1), retrace=round(retrace * 100, 1),
-                dist_ema20_pct=round(dist, 2), ema_spread_pct=round(spread, 2),
-                ema20_slope_pct=round(slope, 2),
-                base_range_pct=round(base_rng, 1),
-                higher_low_pct=round(higher_low, 1),
-                bars_since_low=since_low, bars_since_peak=since_peak,
-                i_low=i_low, i_peak=i_peak, i_spike=i_spike)
+    info = dict(score=round(float(score), 1), price=float(c[-1]),
+                drop_pct=round(float(drop), 1), bounce_pct=round(float(bounce), 1),
+                vol_spike=round(float(spike), 1), retrace=round(float(retrace) * 100, 1),
+                dist_ema20_pct=round(float(dist), 2), ema_spread_pct=round(float(spread), 2),
+                ema20_slope_pct=round(float(slope), 2),
+                base_range_pct=round(float(base_rng), 1),
+                higher_low_pct=round(float(higher_low), 1),
+                bars_since_low=int(since_low), bars_since_peak=int(since_peak),
+                i_low=int(i_low), i_peak=int(i_peak), i_spike=int(i_spike))
     return info, "match", m
 
 # ===================== CHART (MEXC light theme) =====================
@@ -450,6 +471,12 @@ def scan_one(sym):
     info, reason, m = detect(det_df)
     return sym, df, info, reason, m
 
+def run_pass(symbols, workers, outcome):
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for f in as_completed([ex.submit(scan_one, s) for s in symbols]):
+            sym, df, info, reason, m = f.result()
+            outcome[sym] = (df, info, reason, m)
+
 def main():
     now = time.time()
     state = {k: v for k, v in load_state().items() if now - v < 48 * 3600}
@@ -459,26 +486,42 @@ def main():
     if TEST_SYMBOL:
         symbols = [TEST_SYMBOL]
         print(f"TEST MODE: only {TEST_SYMBOL}")
-    print(f"Scanning {len(symbols)} pairs on 4H...")
+    print(f"Scanning {len(symbols)} pairs on 4H (workers={WORKERS}, interval={REQ_INTERVAL}s, min score={MIN_SCORE})...")
 
-    results, cache = [], {}
-    reasons, near = Counter(), []
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        for f in as_completed([ex.submit(scan_one, s) for s in symbols]):
-            sym, df, info, reason, m = f.result()
-            reasons[reason] += 1
-            if TEST_SYMBOL:
-                print(f"{sym}: {reason}  {m}")
-            if info:
-                cache[sym] = df
-                results.append({"symbol": sym, **info})
-            elif reason in REASON_ORDER and REASON_ORDER.index(reason) >= NEAR_MISS_FROM:
-                near.append((REASON_ORDER.index(reason), sym, reason, m))
+    outcome = {}
+    run_pass(symbols, WORKERS, outcome)
+
+    # retry pairs whose data could not be fetched
+    for p in range(1, RETRY_PASSES + 1):
+        missing = [s for s, o in outcome.items() if o[2] == "no_data"]
+        if not missing:
+            break
+        print(f"Retry pass {p}: {len(missing)} pairs without data...")
+        time.sleep(5)
+        run_pass(missing, 2, outcome)
+
+    reasons = Counter(o[2] for o in outcome.values())
+    results, cache, near = [], {}, []
+    for sym, (df, info, reason, m) in outcome.items():
+        if TEST_SYMBOL:
+            print(f"{sym}: {reason}  {m}")
+        if info:
+            cache[sym] = df
+            results.append({"symbol": sym, **info})
+        elif reason in REASON_ORDER and REASON_ORDER.index(reason) >= NEAR_MISS_FROM:
+            near.append((REASON_ORDER.index(reason), sym, reason, m))
 
     print("\n--- REJECT REASONS ---")
     for k in REASON_ORDER + ["match"]:
         if reasons.get(k):
             print(f"  {k:20s} {reasons[k]}")
+
+    print("\n--- API ERRORS ---")
+    if ERRS:
+        for k, v in ERRS.most_common():
+            print(f"  {k:20s} {v}")
+    else:
+        print("  none")
 
     near.sort(key=lambda t: -t[0])
     if near:
@@ -489,19 +532,23 @@ def main():
     results.sort(key=lambda r: r["score"], reverse=True)
     print(f"\nMatches: {len(results)}")
     for r in results:
+        tag = "" if r["score"] >= MIN_SCORE else f"  [below min score {MIN_SCORE}]"
         print(f"  {r['symbol']}  score={r['score']}  drop={r['drop_pct']}%  "
               f"bounce={r['bounce_pct']}%  vol x{r['vol_spike']}  "
               f"dist={r['dist_ema20_pct']}%  spread={r['ema_spread_pct']}%  "
-              f"hl=+{r['higher_low_pct']}%")
+              f"hl=+{r['higher_low_pct']}%{tag}")
 
-    if TEST_SYMBOL or not results:
+    eligible = [r for r in results if r["score"] >= MIN_SCORE]
+    print(f"Eligible for alert (score >= {MIN_SCORE}): {len(eligible)}")
+
+    if TEST_SYMBOL or not eligible:
         return
     if not BOT_TOKEN or not CHAT_ID:
         print("ERROR: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secrets are missing.")
         raise SystemExit(1)
 
     sent = 0
-    for r in results:
+    for r in eligible:
         sym = r["symbol"]
         if now - state.get(sym, 0) < COOLDOWN_HOURS * 3600:
             print(f"  skip {sym} (alerted within {COOLDOWN_HOURS}h)")
