@@ -3,11 +3,14 @@
 # Pattern (CFG-style):
 #   1) Downtrend  -> 2) Base at low -> 3) Volume-spike PUMP above EMA20
 #   -> 4) RETEST of EMA 6/12/20 cluster -> 5) HOLD (higher low, no
-#   close below EMA20) and MOVE UPSIDE (last closed candle green, > EMA12)
+#   close below EMA20) and MOVE UPSIDE
 # Crypto pairs only | alert once per 24h per pair
 # Charts: 4H + 1D + 7D (MEXC light theme)
+# DEBUG: prints reject reasons + near misses. TEST_SYMBOL=CFG_USDT
+#        runs one pair, prints all metrics, sends nothing.
 # ============================================================
 import os, io, re, json, time, math, warnings
+from collections import Counter
 import requests
 import numpy as np
 import pandas as pd
@@ -23,10 +26,11 @@ def envf(name, default):
     return type(default)(os.getenv(name, default))
 
 USE_CLOSED_ONLY     = os.getenv("USE_CLOSED_ONLY", "true").lower() == "true"
-WORKERS             = 8
+WORKERS             = 6
 MAX_ALERTS_PER_RUN  = envf("MAX_ALERTS_PER_RUN", 15)
 COOLDOWN_HOURS      = envf("COOLDOWN_HOURS", 24)
 EXTRA_EXCLUDE       = {x.strip().upper() for x in os.getenv("EXTRA_EXCLUDE", "").split(",") if x.strip()}
+TEST_SYMBOL         = os.getenv("TEST_SYMBOL", "").strip().upper()   # e.g. CFG_USDT
 
 # --- 1) Downtrend ---
 DROP_LOOKBACK        = 120
@@ -36,32 +40,32 @@ MIN_BARS_SINCE_LOW   = 4
 MAX_BARS_SINCE_LOW   = 45
 
 # --- 2) Base around the low (before the pump) ---
-BASE_BARS_BEFORE     = 3       # bars before the low included in base window
-MAX_BASE_RANGE_PCT   = 20.0    # base window (low-3 .. spike-1) high/low range
+BASE_BARS_BEFORE     = 3
+MAX_BASE_RANGE_PCT   = 25.0
 
 # --- 3) Pump (volume spike) ---
 MIN_BOUNCE_PCT       = 15.0
 MIN_BARS_SINCE_PEAK  = 2
 MAX_BARS_SINCE_PEAK  = 30
-MIN_VOL_SPIKE        = 3.0
+MIN_VOL_SPIKE        = 2.5
 REQUIRE_GREEN_SPIKE  = True
 REQUIRE_SPIKE_ABOVE_EMA20 = True
 
 # --- 4) Retest ---
 MIN_RETRACE          = 0.15
 MAX_RETRACE          = 0.90
-RETEST_TOUCH_PCT     = 4.0     # retest low must come within this % above EMA20 (or below)
-MAX_EMA_SPREAD_PCT   = 3.5     # tight EMA 6/12/20 cluster
+RETEST_TOUCH_PCT     = 4.0
+MAX_EMA_SPREAD_PCT   = 3.5
 MIN_DIST_EMA20_PCT   = -3.0
 MAX_DIST_EMA20_PCT   = 6.0
 
 # --- 5) Hold + move upside ---
-HOLD_TOL_PCT         = 2.0     # no close below EMA20 by more than this after the pump
-MIN_HIGHER_LOW_PCT   = 3.0     # retest low must be this % above the swing low
-MIN_EMA20_SLOPE_PCT  = -1.5    # EMA20 change over last 6 bars
-REQUIRE_LAST_GREEN   = True    # last closed candle green
-REQUIRE_ABOVE_EMA12  = True    # last close >= EMA12
-REQUIRE_EMA6_OVER_20 = True    # EMA6 >= EMA20 * 0.995 (cluster turning up)
+HOLD_TOL_PCT         = 2.0
+MIN_HIGHER_LOW_PCT   = 3.0
+MIN_EMA20_SLOPE_PCT  = -1.5
+REQUIRE_LAST_GREEN   = False
+REQUIRE_ABOVE_EMA12  = True
+REQUIRE_EMA6_OVER_20 = True
 
 PLOT_CANDLES        = 100
 STATE_FILE          = "sent_alerts.json"
@@ -76,15 +80,20 @@ TF = {
     "7D": ("Week1", 7 * 86400,  120, "%y-%m-%d"),
 }
 
+# order of checks (used to detect "near misses")
+REASON_ORDER = ["no_data", "too_short", "low_window", "drop_small", "ema_stack_low",
+                "bounce_small", "peak_age", "vol_base", "vol_spike", "spike_not_green",
+                "spike_below_ema20", "base_range", "retrace", "retest_touch",
+                "ema_spread", "dist_ema20", "hold_broke_ema20", "higher_low",
+                "ema20_slope", "last_not_green", "below_ema12", "ema6_below_ema20"]
+NEAR_MISS_FROM = REASON_ORDER.index("base_range")
+
 # ===================== CRYPTO-ONLY FILTER =====================
 NON_CRYPTO_BASES = {
-    # metals / energy / commodities
     "XAU", "XAG", "GOLD", "SILVER", "OIL", "USOIL", "UKOIL", "BRENT", "WTI",
     "NATGAS", "COPPER", "PLATINUM", "PALLADIUM",
-    # forex / indices
     "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD", "SPX", "SPX500", "NAS100",
     "NDX", "US30", "DJI", "DXY", "SP500", "NASDAQ",
-    # US stocks / ETFs
     "AAPL", "TSLA", "NVDA", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NFLX",
     "AMD", "INTC", "MSTR", "HOOD", "PLTR", "BABA", "UBER", "DIS", "NKE",
     "PYPL", "SHOP", "ORCL", "CRM", "ADBE", "QCOM", "AVGO", "TSM", "SPY", "QQQ",
@@ -128,8 +137,6 @@ def get_symbols():
                 continue
             (out if is_crypto(d) else excluded).append(d["symbol"])
     print(f"Crypto pairs: {len(out)} | excluded non-crypto: {len(excluded)}")
-    if excluded:
-        print("Excluded:", ", ".join(sorted(excluded)))
     return sorted(set(out))
 
 def get_klines(symbol, tf):
@@ -153,10 +160,12 @@ def get_klines(symbol, tf):
     return df
 
 # ===================== PATTERN DETECTION =====================
+# returns (info or None, reason, metrics)
 def detect(df):
+    m = {}
     n = len(df)
     if n < 80:
-        return None
+        return None, "too_short", m
     o, h, l, c, v = (df.open.values, df.high.values, df.low.values,
                      df.close.values, df.vol.values)
     e6, e12, e20 = df.e6.values, df.e12.values, df.e20.values
@@ -165,98 +174,107 @@ def detect(df):
     w0 = max(0, n - 1 - MAX_BARS_SINCE_LOW)
     i_low = w0 + int(np.argmin(l[w0:]))
     since_low = n - 1 - i_low
+    m["bars_since_low"] = since_low
     if since_low < MIN_BARS_SINCE_LOW or since_low > MAX_BARS_SINCE_LOW:
-        return None
+        return None, "low_window", m
 
     p0 = max(0, i_low - DROP_LOOKBACK)
     if i_low - p0 < 20:
-        return None
+        return None, "low_window", m
     i_high = p0 + int(np.argmax(h[p0:i_low + 1]))
     if i_low - i_high < MIN_BARS_HIGH_TO_LOW:
-        return None
+        return None, "drop_small", m
     drop = (h[i_high] - l[i_low]) / h[i_high] * 100
+    m["drop%"] = round(drop, 1)
     if drop < MIN_DROP_PCT:
-        return None
-    if not (e6[i_low] < e12[i_low] < e20[i_low]):      # bearish EMA stack at low
-        return None
+        return None, "drop_small", m
+    if not (e6[i_low] < e12[i_low] < e20[i_low]):
+        return None, "ema_stack_low", m
 
-    # ---------- 3) PUMP (bounce + volume spike) ----------
+    # ---------- 3) PUMP ----------
     i_peak = i_low + int(np.argmax(h[i_low:]))
     if i_peak <= i_low:
-        return None
+        return None, "bounce_small", m
     bounce = (h[i_peak] / l[i_low] - 1) * 100
     since_peak = n - 1 - i_peak
+    m["bounce%"] = round(bounce, 1); m["bars_since_peak"] = since_peak
     if bounce < MIN_BOUNCE_PCT:
-        return None
+        return None, "bounce_small", m
     if since_peak < MIN_BARS_SINCE_PEAK or since_peak > MAX_BARS_SINCE_PEAK:
-        return None
+        return None, "peak_age", m
 
     b0 = max(0, i_low - 30)
     base_vol = v[b0:i_low].mean() if i_low > b0 else 0
     if base_vol <= 0:
-        return None
+        return None, "vol_base", m
     s_end = min(n, i_peak + 2)
     i_spike = i_low + int(np.argmax(v[i_low:s_end]))
     spike = v[i_spike] / base_vol
+    m["vol_spike_x"] = round(spike, 1)
     if spike < MIN_VOL_SPIKE:
-        return None
+        return None, "vol_spike", m
     if REQUIRE_GREEN_SPIKE and c[i_spike] <= o[i_spike]:
-        return None
+        return None, "spike_not_green", m
     if REQUIRE_SPIKE_ABOVE_EMA20 and c[i_spike] <= e20[i_spike]:
-        return None
+        return None, "spike_below_ema20", m
 
-    # ---------- 2) BASE before the pump ----------
+    # ---------- 2) BASE ----------
     bs = max(0, i_low - BASE_BARS_BEFORE)
-    be = i_spike                                    # exclusive: candles before the spike
+    be = i_spike
     base_rng = 0.0
     if be - bs >= 3:
         lo_b = l[bs:be].min()
         base_rng = (h[bs:be].max() - lo_b) / lo_b * 100
-        if base_rng > MAX_BASE_RANGE_PCT:
-            return None
+    m["base_range%"] = round(base_rng, 1)
+    if base_rng > MAX_BASE_RANGE_PCT:
+        return None, "base_range", m
 
     # ---------- 4) RETEST ----------
     rng = h[i_peak] - l[i_low]
     retrace = (h[i_peak] - c[-1]) / rng if rng > 0 else 0
+    m["retrace%"] = round(retrace * 100, 1)
     if retrace < MIN_RETRACE or retrace > MAX_RETRACE:
-        return None
+        return None, "retrace", m
 
-    k_rl = i_peak + int(np.argmin(l[i_peak:]))      # retest low index
+    k_rl = i_peak + int(np.argmin(l[i_peak:]))
     retest_low = l[k_rl]
-    touch = (retest_low / e20[k_rl] - 1) * 100      # how close retest low came to EMA20
+    touch = (retest_low / e20[k_rl] - 1) * 100
+    m["retest_touch%"] = round(touch, 2)
     if touch > RETEST_TOUCH_PCT:
-        return None
+        return None, "retest_touch", m
 
     ema_vals = [e6[-1], e12[-1], e20[-1]]
     spread = (max(ema_vals) - min(ema_vals)) / c[-1] * 100
+    m["ema_spread%"] = round(spread, 2)
     if spread > MAX_EMA_SPREAD_PCT:
-        return None
+        return None, "ema_spread", m
 
     dist = (c[-1] - e20[-1]) / e20[-1] * 100
+    m["dist_ema20%"] = round(dist, 2)
     if dist < MIN_DIST_EMA20_PCT or dist > MAX_DIST_EMA20_PCT:
-        return None
+        return None, "dist_ema20", m
 
     # ---------- 5) HOLD ----------
     if n - 1 > i_spike:
-        after_c = c[i_spike + 1:]
-        after_e20 = e20[i_spike + 1:]
-        if (after_c < after_e20 * (1 - HOLD_TOL_PCT / 100)).any():
-            return None                              # broke below EMA20 -> not holding
+        if (c[i_spike + 1:] < e20[i_spike + 1:] * (1 - HOLD_TOL_PCT / 100)).any():
+            return None, "hold_broke_ema20", m
     higher_low = (retest_low / l[i_low] - 1) * 100
+    m["higher_low%"] = round(higher_low, 1)
     if higher_low < MIN_HIGHER_LOW_PCT:
-        return None                                  # retest too close to / below swing low
+        return None, "higher_low", m
 
     slope = (e20[-1] / e20[-7] - 1) * 100
+    m["ema20_slope%"] = round(slope, 2)
     if slope < MIN_EMA20_SLOPE_PCT:
-        return None
+        return None, "ema20_slope", m
 
     # ---------- 5) MOVE UPSIDE ----------
     if REQUIRE_LAST_GREEN and c[-1] <= o[-1]:
-        return None
+        return None, "last_not_green", m
     if REQUIRE_ABOVE_EMA12 and c[-1] < e12[-1]:
-        return None
+        return None, "below_ema12", m
     if REQUIRE_EMA6_OVER_20 and e6[-1] < e20[-1] * 0.995:
-        return None
+        return None, "ema6_below_ema20", m
 
     score = (min(drop, 70) / 70 * 20 +
              min(bounce, 60) / 60 * 15 +
@@ -264,7 +282,7 @@ def detect(df):
              max(0, 1 - spread / MAX_EMA_SPREAD_PCT) * 20 +
              max(0, 1 - abs(dist) / MAX_DIST_EMA20_PCT) * 10 +
              min(higher_low, 15) / 15 * 15)
-    return dict(score=round(score, 1), price=float(c[-1]),
+    info = dict(score=round(score, 1), price=float(c[-1]),
                 drop_pct=round(drop, 1), bounce_pct=round(bounce, 1),
                 vol_spike=round(spike, 1), retrace=round(retrace * 100, 1),
                 dist_ema20_pct=round(dist, 2), ema_spread_pct=round(spread, 2),
@@ -273,6 +291,7 @@ def detect(df):
                 higher_low_pct=round(higher_low, 1),
                 bars_since_low=since_low, bars_since_peak=since_peak,
                 i_low=i_low, i_peak=i_peak, i_spike=i_spike)
+    return info, "match", m
 
 # ===================== CHART (MEXC light theme) =====================
 UP, DOWN = "#2EBD85", "#F6465D"
@@ -426,9 +445,10 @@ def save_state(state):
 def scan_one(sym):
     df = get_klines(sym, "4H")
     if df is None:
-        return sym, None, None
+        return sym, None, None, "no_data", {}
     det_df = df.iloc[:-1] if (USE_CLOSED_ONLY and len(df) > 1) else df
-    return sym, df, detect(det_df)
+    info, reason, m = detect(det_df)
+    return sym, df, info, reason, m
 
 def main():
     now = time.time()
@@ -436,24 +456,45 @@ def main():
     save_state(state)
 
     symbols = get_symbols()
+    if TEST_SYMBOL:
+        symbols = [TEST_SYMBOL]
+        print(f"TEST MODE: only {TEST_SYMBOL}")
     print(f"Scanning {len(symbols)} pairs on 4H...")
+
     results, cache = [], {}
+    reasons, near = Counter(), []
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         for f in as_completed([ex.submit(scan_one, s) for s in symbols]):
-            sym, df, info = f.result()
+            sym, df, info, reason, m = f.result()
+            reasons[reason] += 1
+            if TEST_SYMBOL:
+                print(f"{sym}: {reason}  {m}")
             if info:
                 cache[sym] = df
                 results.append({"symbol": sym, **info})
+            elif reason in REASON_ORDER and REASON_ORDER.index(reason) >= NEAR_MISS_FROM:
+                near.append((REASON_ORDER.index(reason), sym, reason, m))
+
+    print("\n--- REJECT REASONS ---")
+    for k in REASON_ORDER + ["match"]:
+        if reasons.get(k):
+            print(f"  {k:20s} {reasons[k]}")
+
+    near.sort(key=lambda t: -t[0])
+    if near:
+        print(f"\n--- NEAR MISSES (passed pump stage, failed later) top {min(20, len(near))} ---")
+        for _, sym, reason, m in near[:20]:
+            print(f"  {sym:18s} failed: {reason:18s} {m}")
 
     results.sort(key=lambda r: r["score"], reverse=True)
-    print(f"Matches: {len(results)}")
+    print(f"\nMatches: {len(results)}")
     for r in results:
         print(f"  {r['symbol']}  score={r['score']}  drop={r['drop_pct']}%  "
               f"bounce={r['bounce_pct']}%  vol x{r['vol_spike']}  "
               f"dist={r['dist_ema20_pct']}%  spread={r['ema_spread_pct']}%  "
               f"hl=+{r['higher_low_pct']}%")
 
-    if not results:
+    if TEST_SYMBOL or not results:
         return
     if not BOT_TOKEN or not CHAT_ID:
         print("ERROR: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secrets are missing.")
